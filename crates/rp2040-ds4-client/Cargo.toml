@@ -1,0 +1,15 @@
+[package]
+name = "rp2040-ds4-client"
+description = "Send DualShock 4 button frames to an RP2040 board over serial."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "rp2040-send-all-buttons"
+path = "src/main.rs"
+
+[dependencies]
+livvirtualhid.workspace = true
+serialport = "4"

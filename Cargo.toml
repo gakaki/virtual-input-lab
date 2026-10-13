@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/libvirtualhid-sys",
+  "crates/livvirtualhid",
+  "crates/libvirtualhid-py",
+  "crates/rp2040-ds4-client",
+  "crates/chiaki-socket-client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/LizardByte/libvirtualhid"
+
+[workspace.dependencies]
+libvirtualhid-sys = { path = "crates/libvirtualhid-sys" }
+livvirtualhid = { path = "crates/livvirtualhid" }

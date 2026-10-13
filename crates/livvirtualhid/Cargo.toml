@@ -1,0 +1,11 @@
+[package]
+name = "livvirtualhid"
+description = "Safe Rust bindings and a key-mapping helper for libvirtualhid."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+libvirtualhid-sys.workspace = true
+

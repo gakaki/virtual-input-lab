@@ -1,0 +1,11 @@
+livvirtualhid-mac build
+
+upstream : LizardByte/libvirtualhid
+commit   : 006dccc8c508e2a54495d0b1a5b277519b146fe4
+platform : macOS arm64 (C++ library is universal: arm64 + x86_64)
+license  : MIT (library), LB-SAL 1.0 (brokers, not included here)
+
+This bundle is an unsigned local build. The C++ library, the Rust bindings, and
+the Python module all work offline. Creating real macOS virtual HID gamepads
+still requires the upstream signed broker, Apple's virtual HID entitlement, and
+a machine license.

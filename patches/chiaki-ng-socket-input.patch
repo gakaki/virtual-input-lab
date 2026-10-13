@@ -1,0 +1,342 @@
+diff --git a/gui/include/controllermanager.h b/gui/include/controllermanager.h
+index 91fd640..00bf409 100644
+--- a/gui/include/controllermanager.h
++++ b/gui/include/controllermanager.h
+@@ -38,6 +38,18 @@ class ControllerManager : public QObject
+ 		bool moved;
+ 		uint8_t dualsense_intensity;
+ 
++		// Local socket input source: a separate program (Python, Rust, ...)
++		// pushes controller states over a Unix datagram socket. Lives here so
++		// it is available whenever the app runs, not only during a stream.
++		ChiakiControllerState socket_input_state;
++		QString socket_input_path;
++		int socket_input_fd;
++		bool socket_input_dirty;
++		uint64_t socket_input_last_ms;
++		void StartSocketInput();
++		void StopSocketInput();
++		void PollSocketInput();
++
+ 		void ControllerClosed(Controller *controller);
+ 		void CheckMoved();
+ 
+@@ -61,10 +73,12 @@ class ControllerManager : public QObject
+ 		void creatingControllerMapping(bool creating_controller_mapping);
+ 		QSet<int> GetAvailableControllers();
+ 		Controller *OpenController(int device_id);
++		const ChiakiControllerState &GetSocketInputState() const { return socket_input_state; }
+ 
+ 	signals:
+ 		void AvailableControllersUpdated();
+ 		void ControllerMoved();
++		void SocketInputStateChanged();
+ };
+ 
+ class Controller : public QObject
+diff --git a/gui/include/socketinput_protocol.h b/gui/include/socketinput_protocol.h
+new file mode 100644
+index 0000000..58f2900
+--- /dev/null
++++ b/gui/include/socketinput_protocol.h
+@@ -0,0 +1,89 @@
++// SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
++
++/**
++ * @file gui/include/socketinput_protocol.h
++ * @brief Wire format for the local socket controller input source.
++ *
++ * A local program (Python, Rust, ...) sends one fixed-size datagram per
++ * controller update to a Unix datagram socket. The fields mirror the subset of
++ * ChiakiControllerState that a digital/analog gamepad needs.
++ *
++ * Layout is explicit: no implicit padding, little-endian, 24 bytes.
++ */
++
++#ifndef CHIAKI_SOCKETINPUT_PROTOCOL_H
++#define CHIAKI_SOCKETINPUT_PROTOCOL_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/** "CIPK" in little-endian byte order. */
++#define CHIAKI_SOCKET_INPUT_MAGIC 0x4B504943u
++/** Protocol version carried by every message. */
++#define CHIAKI_SOCKET_INPUT_VERSION 1u
++/** Exact datagram size in bytes. */
++#define CHIAKI_SOCKET_INPUT_MESSAGE_SIZE 24u
++
++/** Default socket path; override with the CHIAKI_NG_INPUT_SOCKET env var. */
++#define CHIAKI_SOCKET_INPUT_DEFAULT_PATH "/tmp/chiaki-ng-input.sock"
++
++/**
++ * @brief One controller state update.
++ *
++ * `buttons` uses the ChiakiControllerButton bit values; sticks are
++ * `-0x7fff .. 0x7fff` with `0` centred; triggers are `0 .. 255`.
++ */
++typedef struct chiaki_socket_input_message_t
++{
++	uint32_t magic;
++	uint16_t version;
++	uint16_t size;
++	uint32_t buttons;
++	uint8_t l2_state;
++	uint8_t r2_state;
++	int16_t left_x;
++	int16_t left_y;
++	int16_t right_x;
++	int16_t right_y;
++	uint16_t reserved;
++} ChiakiSocketInputMessage;
++
++#ifdef __cplusplus
++}
++#endif
++
++#ifdef __cplusplus
++static_assert(sizeof(ChiakiSocketInputMessage) == CHIAKI_SOCKET_INPUT_MESSAGE_SIZE,
++	"ChiakiSocketInputMessage must not contain implicit padding");
++#else
++#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
++_Static_assert(sizeof(ChiakiSocketInputMessage) == CHIAKI_SOCKET_INPUT_MESSAGE_SIZE,
++	"ChiakiSocketInputMessage must not contain implicit padding");
++#endif
++#endif
++
++/**
++ * @brief Validate a received datagram.
++ *
++ * @param data Received bytes.
++ * @param length Number of received bytes.
++ * @return 1 when the datagram is a well-formed message of this version.
++ */
++static inline int chiaki_socket_input_validate(const void *data, unsigned length)
++{
++	const ChiakiSocketInputMessage *message = (const ChiakiSocketInputMessage *)data;
++	if(length != CHIAKI_SOCKET_INPUT_MESSAGE_SIZE)
++		return 0;
++	if(message->magic != CHIAKI_SOCKET_INPUT_MAGIC)
++		return 0;
++	if(message->version != CHIAKI_SOCKET_INPUT_VERSION)
++		return 0;
++	if(message->size != CHIAKI_SOCKET_INPUT_MESSAGE_SIZE)
++		return 0;
++	return 1;
++}
++
++#endif // CHIAKI_SOCKETINPUT_PROTOCOL_H
+diff --git a/gui/src/controllermanager.cpp b/gui/src/controllermanager.cpp
+index 8bf27f3..95e128b 100644
+--- a/gui/src/controllermanager.cpp
++++ b/gui/src/controllermanager.cpp
+@@ -6,6 +6,20 @@
+ #include <QByteArray>
+ #include <QTimer>
+ 
++#include <socketinput_protocol.h>
++
++// Local socket input source (Unix datagram socket). Apple clang does not
++// define __unix__, so macOS has to be listed explicitly.
++#if defined(__unix__) || defined(__APPLE__)
++#include <cerrno>
++#include <chrono>
++#include <cstdlib>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++#define CHIAKI_GUI_HAVE_SOCKET_INPUT 1
++#endif
++
+ #ifdef CHIAKI_GUI_ENABLE_SDL_GAMECONTROLLER
+ #include <SDL.h>
+ #endif
+@@ -130,6 +144,8 @@ static ControllerManager *instance = nullptr;
+ 
+ #define UPDATE_INTERVAL_MS 4
+ #define MOVE_CHECK_MS 1000
++// Release every control this long after the last socket input message.
++#define SOCKET_INPUT_TIMEOUT_MS 1000
+ 
+ ControllerManager *ControllerManager::GetInstance()
+ {
+@@ -140,7 +156,8 @@ ControllerManager *ControllerManager::GetInstance()
+ 
+ ControllerManager::ControllerManager(QObject *parent)
+ 	: QObject(parent), creating_controller_mapping(false),
+-	joystick_allow_background_events(true), dualsense_intensity(0x00), is_app_active(true)
++	joystick_allow_background_events(true), dualsense_intensity(0x00), is_app_active(true),
++	socket_input_fd(-1), socket_input_dirty(false), socket_input_last_ms(0)
+ {
+ #ifdef CHIAKI_GUI_ENABLE_SDL_GAMECONTROLLER
+ 	SDL_SetMainReady();
+@@ -162,10 +179,13 @@ ControllerManager::ControllerManager(QObject *parent)
+ #endif
+ 
+ 	UpdateAvailableControllers();
++	chiaki_controller_state_set_idle(&socket_input_state);
++	StartSocketInput();
+ }
+ 
+ ControllerManager::~ControllerManager()
+ {
++	StopSocketInput();
+ #ifdef CHIAKI_GUI_ENABLE_SDL_GAMECONTROLLER
+ 	open_controllers.clear();
+ 	SDL_Quit();
+@@ -265,11 +285,130 @@ void ControllerManager::HandleEvents()
+ 			case SDL_CONTROLLERTOUCHPADMOTION:
+ 			case SDL_CONTROLLERTOUCHPADUP:
+ #endif
+-				if(joystick_allow_background_events || is_app_active)
++			if(joystick_allow_background_events || is_app_active)
+ 					ControllerEvent(event);
+ 				break;
+ 		}
+ 	}
++#endif
++	PollSocketInput();
++}
++
++void ControllerManager::StartSocketInput()
++{
++#ifdef CHIAKI_GUI_HAVE_SOCKET_INPUT
++	const char *configured_path = getenv("CHIAKI_NG_INPUT_SOCKET");
++	const char *path = (configured_path && *configured_path) ? configured_path : CHIAKI_SOCKET_INPUT_DEFAULT_PATH;
++
++	socket_input_fd = ::socket(AF_UNIX, SOCK_DGRAM, 0);
++	if(socket_input_fd < 0)
++	{
++		qWarning("Socket input: socket() failed: %s", strerror(errno));
++		return;
++	}
++
++	struct sockaddr_un address;
++	memset(&address, 0, sizeof(address));
++	address.sun_family = AF_UNIX;
++	const size_t path_length = strlen(path);
++	if(path_length >= sizeof(address.sun_path))
++	{
++		qWarning("Socket input: path too long: %s", path);
++		::close(socket_input_fd);
++		socket_input_fd = -1;
++		return;
++	}
++	memcpy(address.sun_path, path, path_length);
++
++	// A stale socket file from a previous run would make bind() fail.
++	::unlink(path);
++	if(::bind(socket_input_fd, reinterpret_cast<struct sockaddr *>(&address), sizeof(address)) < 0)
++	{
++		qWarning("Socket input: bind(%s) failed: %s", path, strerror(errno));
++		::close(socket_input_fd);
++		socket_input_fd = -1;
++		return;
++	}
++
++	socket_input_path = QString::fromUtf8(path, static_cast<int>(path_length));
++	qInfo("Socket input: listening on %s", path);
++#endif
++}
++
++void ControllerManager::StopSocketInput()
++{
++#ifdef CHIAKI_GUI_HAVE_SOCKET_INPUT
++	if(socket_input_fd >= 0)
++	{
++		::close(socket_input_fd);
++		socket_input_fd = -1;
++	}
++	if(!socket_input_path.isEmpty())
++	{
++		::unlink(socket_input_path.toUtf8().constData());
++		socket_input_path.clear();
++	}
++#endif
++}
++
++void ControllerManager::PollSocketInput()
++{
++#ifdef CHIAKI_GUI_HAVE_SOCKET_INPUT
++	if(socket_input_fd < 0)
++		return;
++
++	const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++		std::chrono::steady_clock::now().time_since_epoch()).count();
++
++	// Drain every queued datagram.
++	for(;;)
++	{
++		ChiakiSocketInputMessage message;
++		const ssize_t received = ::recv(socket_input_fd, &message, sizeof(message), MSG_DONTWAIT);
++		if(received < 0)
++			break;
++		if(!chiaki_socket_input_validate(&message, static_cast<unsigned>(received)))
++			continue;
++
++		const uint32_t previous_buttons = socket_input_state.buttons;
++		socket_input_state.buttons = message.buttons;
++		socket_input_state.l2_state = message.l2_state;
++		socket_input_state.r2_state = message.r2_state;
++		socket_input_state.left_x = message.left_x;
++		socket_input_state.left_y = message.left_y;
++		socket_input_state.right_x = message.right_x;
++		socket_input_state.right_y = message.right_y;
++		socket_input_last_ms = static_cast<uint64_t>(now_ms);
++		socket_input_dirty = true;
++
++		// Log only on change so a 50 Hz sender does not flood the log.
++		if(message.buttons != previous_buttons)
++		{
++			qInfo("Socket input: buttons=0x%04x l2=%u r2=%u left=(%d,%d) right=(%d,%d)",
++				message.buttons & 0xFFFFu,
++				message.l2_state,
++				message.r2_state,
++				message.left_x,
++				message.left_y,
++				message.right_x,
++				message.right_y);
++		}
++	}
++
++	// Release everything once the sender goes quiet, so a client that crashes
++	// cannot leave a button stuck down.
++	if(socket_input_dirty && socket_input_last_ms != 0 &&
++		now_ms - static_cast<int64_t>(socket_input_last_ms) > SOCKET_INPUT_TIMEOUT_MS)
++	{
++		chiaki_controller_state_set_idle(&socket_input_state);
++		socket_input_last_ms = 0;
++	}
++
++	if(socket_input_dirty)
++	{
++		socket_input_dirty = false;
++		emit SocketInputStateChanged();
++	}
+ #endif
+ }
+ 
+diff --git a/gui/src/streamsession.cpp b/gui/src/streamsession.cpp
+index d9d0d45..2490be9 100755
+--- a/gui/src/streamsession.cpp
++++ b/gui/src/streamsession.cpp
+@@ -591,6 +591,7 @@ StreamSession::StreamSession(const StreamSessionConnectInfo &connect_info, QObje
+ 
+ #if CHIAKI_GUI_ENABLE_SDL_GAMECONTROLLER
+ 	connect(ControllerManager::GetInstance(), &ControllerManager::AvailableControllersUpdated, this, &StreamSession::UpdateGamepads);
++	connect(ControllerManager::GetInstance(), &ControllerManager::SocketInputStateChanged, this, &StreamSession::SendFeedbackState);
+ 	connect(this, &StreamSession::DualSenseIntensityChanged, ControllerManager::GetInstance(), &ControllerManager::SetDualSenseIntensity);
+ 	if(connect_info.buttons_by_pos)
+ 		ControllerManager::GetInstance()->SetButtonsByPos();
+@@ -1235,6 +1236,8 @@ void StreamSession::DpadSendFeedbackState()
+ 	chiaki_controller_state_or(&state, &state, &sdeck_state);
+ #endif
+ 	chiaki_controller_state_or(&state, &state, &keyboard_state);
++	ChiakiControllerState socket_input_state = ControllerManager::GetInstance()->GetSocketInputState();
++	chiaki_controller_state_or(&state, &state, &socket_input_state);
+ 	chiaki_controller_state_or(&state, &state, &touch_state);
+ 
+ 	if(input_block)

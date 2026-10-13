@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.15,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "libvirtualhid"
+description = "Python bindings for libvirtualhid virtual gamepads (DualShock 4 key mapping)."
+requires-python = ">=3.9"
+license = { text = "MIT" }
+readme = "README.md"
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Topic :: Games/Entertainment",
+]
+dynamic = ["version"]
+
+[tool.maturin]
+bindings = "pyo3"
+module-name = "libvirtualhid"
+features = ["pyo3/extension-module"]
+strip = true
+

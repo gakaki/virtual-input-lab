@@ -1,0 +1,11 @@
+[package]
+name = "chiaki-socket-client"
+description = "Send controller states to a patched chiaki-ng over its local socket."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "chiaki-send-buttons"
+path = "src/main.rs"

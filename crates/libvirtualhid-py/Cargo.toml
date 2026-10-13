@@ -1,0 +1,20 @@
+[package]
+name = "libvirtualhid-py"
+description = "Python (PyO3) bindings for the livvirtualhid Rust bindings."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "libvirtualhid"
+crate-type = ["cdylib"]
+
+[features]
+default = ["extension-module"]
+# Links the module without libpython so it can be loaded by any interpreter.
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+livvirtualhid.workspace = true
+pyo3 = { version = "0.23", features = ["abi3-py39"] }

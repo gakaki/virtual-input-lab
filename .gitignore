@@ -1,0 +1,10 @@
+/target/
+/build/
+/.venv/
+/dist/
+.DS_Store
+*.o
+*.a
+# 上游 libvirtualhid 为 vendored 源码，含 LB-SAL 许可的 broker 代码，不随本仓库分发。
+# 复现方式见 README「准备 vendored 依赖」。
+/third_party/
